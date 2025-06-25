@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-QR / BAR Run-Timer
-• Multi-code preview (QR + 1-D barcodes)
-• 10-s cooldown per runner ID
-• Big green “SCANNED” drawn on each accepted code
-• Preview scaled ל-640×480 עם Letter-boxing (לא חותך את הפריים)
+QR / BAR Run-Timer  –  Threaded, Adaptive Frame-Skip, Gray-scale
 """
 
 # ---------- 0. IMPORTS & CONSTANTS -----------------------------------------
-import csv, platform, time
+import csv, platform, time, threading, queue, re, logging
 from datetime import datetime
 from pathlib import Path
 
@@ -17,201 +13,235 @@ import cv2, numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
-from pyzbar.pyzbar import decode          # supports EAN-13/8, CODE-128/39, QR, etc.
+from pyzbar.pyzbar import decode
 
-SCAN_COOLDOWN = 10                        # seconds before same code allowed again
-TARGET_W, TARGET_H = 640, 480             # preview window size
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-last_scan_ts: dict[str, float] = {}       # id → last accepted time
-race_started = False
-race_start_ts: datetime | None = None
-runs: dict[str, dict[str, datetime | None]] = {}   # id → {"start": …, "end": …}
+SCAN_COOLDOWN  = 10                # s between identical IDs
+TARGET_W, TARGET_H = 640, 480      # preview window
+MAX_FRAME_SKIP = 6                 # upper bound for adaptive skip
 
-# ---------- 1. GUI ---------------------------------------------------------
-root = tk.Tk()
-root.title("QR / BAR Run-Timer")
-root.geometry("740x470")
+ID_RE = re.compile(r'^[0-9]{6,12}$')  # דוגמה: 6-12 ספרות; שנה כראות עיניך
 
-style = ttk.Style(root)
-style.configure("Treeview", rowheight=28)
+# ---------- 1. CAMERA THREAD ----------------------------------------------
+class CameraThread(threading.Thread):
+    """Pushes frames into a queue as fast as possible (dropping old ones)."""
+    def __init__(self, q: queue.Queue, camera_idx: int = 0):
+        super().__init__(daemon=True)
+        self.q = q
+        backend = cv2.CAP_AVFOUNDATION if platform.system() == "Darwin" else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(camera_idx, backend)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  TARGET_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_H)
+        if not self.cap.isOpened():
+            raise RuntimeError("Cannot open webcam")
 
-cols = ("id", "start", "end", "duration")
-view = ttk.Treeview(root, columns=cols, show="headings")
-for c, head in zip(cols, ("ID", "Start", "End", "Duration (hh:mm:ss)")):
-    view.heading(c, text=head)
-    view.column(c, anchor=tk.CENTER)
-view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+    def run(self):
+        while True:
+            ok, frame = self.cap.read()
+            if not ok:
+                continue
+            try:
+                self.q.put_nowait(frame)
+            except queue.Full:
+                # queue full → throw away the oldest
+                try: self.q.get_nowait()
+                except queue.Empty: pass
+                self.q.put_nowait(frame)
 
-iso = lambda dt: dt.isoformat(timespec="seconds") if dt else ""
+# ---------- 2. SCANNER LOGIC ----------------------------------------------
+class Scanner:
+    """Stateless helper that decodes bar/QR-codes from gray frames."""
+    def __init__(self):
+        self.last_scan_ts: dict[str, float] = {}
+        self.frame_skip = 2  # starts low ⇒ snappy first detection
 
-def refresh_table() -> None:
-    view.delete(*view.get_children())
-    for pid, rec in runs.items():
-        dur = (
-            str(rec["end"] - rec["start"]).split(".")[0]
-            if rec["start"] and rec["end"] else ""
-        )
-        view.insert(
-            "", tk.END,
-            values=(pid, iso(rec["start"]), iso(rec["end"]), dur)
-        )
-    root.title(f"QR / BAR Run-Timer – {len(runs)} runners")
+    def process(self, frame: np.ndarray, on_code_cb):
+        """Possibly decode this frame; call `on_code_cb(data, polygon_pts, center)`."""
+        # decide whether to skip this frame
+        if self.frame_skip > 1:
+            self.frame_skip -= 1
+            return  # skip → just down-count
 
-# ---------- 2. LOGIC -------------------------------------------------------
-def record_scan(pid: str) -> None:
-    rec = runs.setdefault(pid, {"start": None, "end": None})
-    if not race_started:
-        return
-    if rec["start"] is None:
-        rec["start"] = race_start_ts
-        return
-    if rec["end"] is None:
-        rec["end"] = datetime.now()
-        return
+        self.frame_skip = 2  # reset; may rise again later
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        found_any = False
 
-    # Extra laps after first finish
-    lap = 1
-    while f"{pid}_lap{lap}" in runs:
-        lap += 1
-    runs[f"{pid}_lap{lap}"] = {
-        "start": race_start_ts,
-        "end":   datetime.now(),
-    }
+        for obj in decode(gray):
+            data = obj.data.decode("utf-8")
+            if not ID_RE.fullmatch(data):
+                continue          # ignore garbage
+            now = time.time()
+            if now - self.last_scan_ts.get(data, 0) < SCAN_COOLDOWN:
+                continue          # cooldown
+            self.last_scan_ts[data] = now
+            found_any = True
 
-def start_race() -> None:
-    global race_started, race_start_ts
-    if race_started or not runs:
-        if not runs:
-            messagebox.showwarning("No runners", "Register at least one runner before starting.")
-        return
-    race_start_ts = datetime.now()
-    race_started  = True
-    for rec in runs.values():
-        rec["start"] = race_start_ts
-    refresh_table()
-    start_btn.config(state=tk.DISABLED)
-    root.bell()
-    messagebox.showinfo("Race started!", f"Gun time: {iso(race_start_ts)}")
+            pts = np.array([(p.x, p.y) for p in obj.polygon], dtype=np.int32)
+            if len(pts) < 4:      # fallback rectangle
+                x, y, w, h = obj.rect
+                pts = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]])
 
-# ---------- 3. SCANNER -----------------------------------------------------
-def handle_scan_preview(camera_index: int = 0) -> None:
-    backend = cv2.CAP_AVFOUNDATION if platform.system() == "Darwin" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(camera_index, backend)
+            cx, cy = pts[:, 0].mean().astype(int), pts[:, 1].mean().astype(int)
+            on_code_cb(data, pts, (cx, cy))
 
-    # Try to request 640×480 from the camera (ignored if unsupported)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  TARGET_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_H)
+        # no code? ⇒ increase skip (max 6)
+        if not found_any:
+            self.frame_skip = min(self.frame_skip + 1, MAX_FRAME_SKIP)
 
-    if not cap.isOpened():
-        messagebox.showerror("Camera error", "Cannot open webcam.")
-        return
+# ---------- 3. MAIN APPLICATION (Tk) ---------------------------------------
+class App:
+    def __init__(self):
+        # --- state --------------------------------------------------------
+        self.runs: dict[str, dict[str, datetime | None]] = {}
+        self.race_started   = False
+        self.race_start_ts: datetime | None = None
 
-    win = tk.Toplevel(root)
-    win.title("Scanner – Esc to close")
-    win.geometry(f"{TARGET_W}x{TARGET_H}")
-    lbl = tk.Label(win)
-    lbl.pack(expand=True)
-    win.bind("<Escape>", lambda *_: (cap.release(), win.destroy()))
+        # --- Tk roots & widgets ------------------------------------------
+        self.root = tk.Tk(); self.root.title("QR / BAR Run-Timer")
+        self.root.geometry("760x500")
+        ttk.Style(self.root).configure("Treeview", rowheight=26)
 
-    def update() -> None:
-        ok, frame = cap.read()
-        if not ok:
-            win.after(15, update)
+        cols = ("id", "start", "end", "duration")
+        self.view = ttk.Treeview(self.root, columns=cols, show="headings")
+        for c, head in zip(cols, ("ID", "Start", "End", "Duration (hh:mm:ss)")):
+            self.view.heading(c, text=head); self.view.column(c, anchor=tk.CENTER)
+        self.view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        # buttons
+        btns = tk.Frame(self.root); btns.pack(fill=tk.X, padx=6, pady=(0, 6))
+        tk.Button(btns, text="Scan (preview)", height=2, width=18,
+                  command=self.start_preview).pack(side=tk.LEFT, padx=4)
+        self.start_btn = tk.Button(btns, text="Start Race", height=2, width=12,
+                                   bg="#e5ffe5", command=self.start_race)
+        self.start_btn.pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Export CSV", height=2, width=12,
+                  command=self.export_csv).pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Quit", height=2, width=8,
+                  command=self.root.destroy).pack(side=tk.RIGHT, padx=4)
+
+        self.refresh_table()
+
+    # ---------- table helpers -------------------------------------------
+    iso = staticmethod(lambda dt: dt.isoformat(timespec="seconds") if dt else "")
+
+    def refresh_table(self):
+        self.view.delete(*self.view.get_children())
+        for pid, rec in self.runs.items():
+            dur = (str(rec["end"] - rec["start"]).split(".")[0]
+                   if rec["start"] and rec["end"] else "")
+            self.view.insert("", tk.END, values=(pid, self.iso(rec["start"]),
+                                                 self.iso(rec["end"]), dur))
+        self.root.title(f"Run-Timer – {len(self.runs)} runners")
+
+    # ---------- race logic ---------------------------------------------
+    def record_scan(self, pid: str):
+        rec = self.runs.setdefault(pid, {"start": None, "end": None})
+        if not self.race_started:
+            return
+        if rec["start"] is None:
+            rec["start"] = self.race_start_ts; return
+        if rec["end"] is None:
+            rec["end"] = datetime.now();       return
+        # laps
+        lap = 1
+        while f"{pid}_lap{lap}" in self.runs: lap += 1
+        self.runs[f"{pid}_lap{lap}"] = {"start": self.race_start_ts, "end": datetime.now()}
+
+    def start_race(self):
+        if self.race_started or not self.runs:
+            if not self.runs:
+                messagebox.showwarning("No runners", "Register at least one runner before starting.")
+            return
+        self.race_start_ts = datetime.now()
+        self.race_started  = True
+        for rec in self.runs.values(): rec["start"] = self.race_start_ts
+        self.refresh_table()
+        self.start_btn.config(state=tk.DISABLED)
+        self.root.bell()
+        messagebox.showinfo("Race started!", f"Gun time: {self.iso(self.race_start_ts)}")
+
+    # ---------- CSV export ---------------------------------------------
+    def export_csv(self):
+        if not self.runs:
+            messagebox.showwarning("Nothing to export", "No data has been recorded.")
             return
 
-        # ---------- Decode ALL codes in current frame ----------------
-        for obj in decode(frame):
-            data = obj.data.decode("utf-8")
-            pts  = np.array([(p.x, p.y) for p in obj.polygon], dtype=np.int32)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile="run_results.csv",
+        )
+        if not path:
+            return
 
-            # Draw outline
-            if len(pts) >= 4:
-                cv2.polylines(frame, [pts], True, (0, 255, 0), 3)
-                cx, cy = pts[:, 0].mean().astype(int), pts[:, 1].mean().astype(int)
-            else:  # Fallback to bounding box
-                x, y, w, h = obj.rect
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                cx, cy = x + w // 2, y + h // 2
+        with open(path, "w", newline="", encoding="utf-8") as fp:
+            # ★ כותרת חדשה – בפורמט mm:ss:ms
+            w = csv.writer(fp)
+            w.writerow(["id", "start", "end", "duration_mm:ss:ms"])
 
-            # Cool-down check
-            now = time.time()
-            if now - last_scan_ts.get(data, 0) >= SCAN_COOLDOWN:
-                last_scan_ts[data] = now
-                record_scan(data)
-                refresh_table()
-                root.bell()
+            for pid, rec in self.runs.items():
+                if rec["start"] and rec["end"]:
+                    td = rec["end"] - rec["start"]  # timedelta
+                    minutes, seconds = divmod(td.seconds, 60)
+                    millis = td.microseconds // 1_000
+                    duration_str = f"{minutes:02d}:{seconds:02d}:{millis:03d}"
+                else:
+                    duration_str = ""
 
-                cv2.putText(
-                    frame, "SCANNED", (cx - 60, cy + 15),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 255, 0), 3
-                )
+                w.writerow([pid, self.iso(rec["start"]),
+                            self.iso(rec["end"]), duration_str])
 
-        # ---------- Scale & letter-box preview to TARGET_W×TARGET_H ----------
-        h, w = frame.shape[:2]
-        scale  = min(TARGET_W / w, TARGET_H / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        resized = cv2.resize(frame, (new_w, new_h))
+        messagebox.showinfo("Export complete", f"Saved to:\n{path}")
 
-        canvas = np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
-        y_off  = (TARGET_H - new_h) // 2
-        x_off  = (TARGET_W - new_w) // 2
-        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    # ---------- preview window ----------------------------------------
+    def start_preview(self):
+        # create camera thread & queue once
+        q = queue.Queue(maxsize=4)
+        try:
+            cam_thread = CameraThread(q)
+        except RuntimeError as e:
+            messagebox.showerror("Camera error", str(e)); return
+        cam_thread.start()
 
-        # ---------- Display in Tkinter --------------------------------------
-        img_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        lbl.imgtk = ImageTk.PhotoImage(Image.fromarray(img_rgb))
-        lbl.configure(image=lbl.imgtk)
-        win.after(15, update)
+        scanner = Scanner()
 
-    update()
+        win = tk.Toplevel(self.root); win.title("Scanner – Esc to close")
+        win.geometry(f"{TARGET_W}x{TARGET_H}")
+        lbl = tk.Label(win); lbl.pack(expand=True)
+        win.bind("<Escape>", lambda *_: win.destroy())
 
-# ---------- 4. EXPORT ------------------------------------------------------
-def export_csv() -> None:
-    if not runs:
-        messagebox.showwarning("Nothing to export", "No data has been recorded.")
-        return
-    path = filedialog.asksaveasfilename(
-        defaultextension=".csv",
-        filetypes=[("CSV files", "*.csv")],
-        initialfile="run_results.csv",
-    )
-    if not path:
-        return
-    with open(path, "w", newline="", encoding="utf-8") as fp:
-        w = csv.writer(fp)
-        w.writerow(["id", "start", "end", "duration_seconds"])
-        for pid, rec in runs.items():
-            sec = (
-                int((rec["end"] - rec["start"]).total_seconds())
-                if rec["start"] and rec["end"] else ""
-            )
-            w.writerow([pid, iso(rec["start"]), iso(rec["end"]), sec])
-    messagebox.showinfo("Export complete", f"Saved to:\n{path}")
+        def on_code(data, pts, center):
+            self.record_scan(data); self.refresh_table(); self.root.bell()
+            # draw feedback
+            cv2.polylines(frame, [pts], True, (0,255,0), 3)
+            cx, cy = center
+            cv2.putText(frame, "SCANNED", (cx-60, cy+15),
+                        cv2.FONT_HERSHEY_DUPLEX, 1.4, (0,255,0), 3)
 
-# ---------- 5. BUTTONS -----------------------------------------------------
-btns = tk.Frame(root)
-btns.pack(fill=tk.X, padx=6, pady=(0, 6))
+        def update():
+            try:
+                global frame
+                frame = q.get_nowait()
+            except queue.Empty:
+                win.after(10, update); return
 
-tk.Button(
-    btns, text="Scan (preview)", height=2, width=18,
-    command=handle_scan_preview
-).pack(side=tk.LEFT, padx=4)
+            scanner.process(frame, on_code)
 
-start_btn = tk.Button(
-    btns, text="Start Race", height=2, width=12, bg="#e5ffe5",
-    command=start_race
-)
-start_btn.pack(side=tk.LEFT, padx=4)
+            # letter-box & display
+            h, w = frame.shape[:2]; scale = min(TARGET_W/w, TARGET_H/h)
+            resized = cv2.resize(frame, (int(w*scale), int(h*scale)))
+            canvas  = np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
+            yoff    = (TARGET_H - resized.shape[0])//2
+            xoff    = (TARGET_W - resized.shape[1])//2
+            canvas[yoff:yoff+resized.shape[0], xoff:xoff+resized.shape[1]] = resized
+            img = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+            lbl.imgtk = ImageTk.PhotoImage(Image.fromarray(img))
+            lbl.configure(image=lbl.imgtk)
+            win.after(10, update)
 
-tk.Button(
-    btns, text="Export CSV", height=2, width=12,
-    command=export_csv
-).pack(side=tk.LEFT, padx=4)
+        update()
 
-tk.Button(
-    btns, text="Quit", height=2, width=8,
-    command=root.destroy
-).pack(side=tk.RIGHT, padx=4)
-
-refresh_table()
-root.mainloop()
+# ---------- 4. ENTRY-POINT -----------------------------------------------
+if __name__ == "__main__":
+    App().root.mainloop()
